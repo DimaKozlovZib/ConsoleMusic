@@ -3,92 +3,134 @@ using System.Threading;
 using NAudio.Wave;
 using System.IO;
 using System.Numerics;
+using NAudio.Utils;
 
 class Program
 {
     static void Main()
     {
-        new MusicManager("./").Play();
+        var system = new TerminalInterface();
 
+        system.AddComponent(new SpectrumVisualization(2, 44.1));
+        system.AddComponent(new LoadBar());
+
+        system.Work("./");
 
         Console.WriteLine("\nВоспроизведение остановлено.");
     }
 }
 
-class MusicManager
+class MusicManager : ICoreState, IPlaybackState
 {
     static readonly string[] file_types = [".mp3", ".wav"];
 
     readonly List<TrackInfo> _files = [];
+
     int _current_pos = 0;
+
+    private AudioFileReader _file_reader;
+    private SpectrumSampleProvider _sample_reader;
+    private WaveOutEvent _output_device;
+
+    public bool IsPlaying
+    {
+        get => _output_device.PlaybackState == NAudio.Wave.PlaybackState.Playing;
+    }
+    public TimeSpan Position { get => _output_device.GetPositionTimeSpan(); }
+    public TimeSpan Duration { get => _file_reader.TotalTime; }
+    public float[] CurrentSamples { get => _sample_reader.GetLastSamples(); }
+    public TrackInfo[] Files { get => [.. _files]; }
 
     public MusicManager(string dirStr)
     {
-        Console.WriteLine(Directory.Exists(dirStr));
-        if (Directory.Exists(dirStr))
+        if (string.IsNullOrWhiteSpace(dirStr))
+            throw new ArgumentException("Путь к директории не может быть пустым.", nameof(dirStr));
+
+        if (!Directory.Exists(dirStr))
+            throw new DirectoryNotFoundException($"Директория не найдена: {dirStr}");
+
+        IEnumerable<string> files = Directory.EnumerateFiles(dirStr, "*.*", SearchOption.AllDirectories);
+
+        foreach (var file in files)
         {
-            IEnumerable<string> files = Directory.EnumerateFiles(dirStr);
+            string extension = Path.GetExtension(file);
+            if (!IsSuportedFile(extension)) continue;
 
-            foreach (var file in files)
+            try
             {
-                string extension = Path.GetExtension(file);
-                if (!IsSuportedFile(extension)) continue;
-
                 using var audioFile = new AudioFileReader(file);
-
-                TrackInfo info = new TrackInfo { file_path = file, name = Path.GetFileNameWithoutExtension(file), time = audioFile.TotalTime };
+                TrackInfo info = new() { file_path = file, name = Path.GetFileNameWithoutExtension(file), time = audioFile.TotalTime };
                 _files.Add(info);
             }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Ошибка чтения файла {file}: {ex.Message}");
+            }
+        }
+
+        if (_files.Count == 0)
+        {
+            throw new InvalidOperationException("В указанной директории не найдено поддерживаемых аудиофайлов.");
+        }
+
+        _output_device = new WaveOutEvent();
+        SetNAudio(_files[0].file_path);
+    }
+
+    private void SetNAudio(string file_path)
+    {
+        _file_reader = new AudioFileReader(file_path);
+        _sample_reader = new SpectrumSampleProvider(_file_reader);
+
+        _output_device.Init(_sample_reader);
+    }
+
+    public void NextTrack()
+    {
+        if (_current_pos == _files.Count - 1) return;
+
+        bool wasPlaying = IsPlaying;
+
+        _current_pos++;
+        SetNAudio(_files[_current_pos].file_path);
+
+        if (wasPlaying)
+        {
+            _output_device.Play();
         }
     }
 
     public void Play()
     {
-        int startTop = Console.CursorTop;
-        Console.CursorVisible = false;
-
-        using var audioFile = new AudioFileReader(_files[0].file_path);
-        var specProvider = new SpectrumSampleProvider(audioFile);
-
-        using var outputDevice = new WaveOutEvent();
-
-        outputDevice.Init(specProvider);
-        outputDevice.Play();
-
-        double totalLength = audioFile.TotalTime.TotalSeconds;
-        SpectrumVisualization sv = new(specProvider.WaveFormat.Channels, specProvider.WaveFormat.SampleRate);
-        int barWidth = 20;
-
-        while (outputDevice.PlaybackState == PlaybackState.Playing)
+        if (!IsPlaying)
         {
-            Console.SetCursorPosition(0, startTop);
-
-            sv.Show(specProvider.GetLastSamples());
-
-            double currentTime = audioFile.CurrentTime.TotalSeconds;
-            double progress = totalLength > 0 ? currentTime / totalLength : 0;
-
-            int countDone = (int)(progress * barWidth);
-
-            string doneBar = new('█', countDone);
-            string remainingBar = new('░', barWidth - countDone);
-
-            Console.Write($"\nПрогресс: [{doneBar}{remainingBar}]\n", ConsoleColor.Red);
-            Console.Write($"{audioFile.CurrentTime.ToString("mm\\:ss")} / {audioFile.TotalTime.ToString("mm\\:ss")}");
-
-            if (Console.KeyAvailable)
-            {
-                ConsoleKeyInfo key = Console.ReadKey(intercept: true);
-
-                if (key.Key == ConsoleKey.Spacebar)
-                {
-                    outputDevice.Stop();
-                    break;
-                }
-            }
-
-            Thread.Sleep(35);
+            _output_device.Play();
         }
+    }
+
+    public void Pause()
+    {
+        if (IsPlaying)
+        {
+            _output_device.Pause();
+        }
+    }
+
+    public void SetPlaying(bool playing)
+    {
+        if (playing) Play();
+        else Pause();
+    }
+
+    public void SetPosition(TimeSpan position)
+    {
+        if (position < TimeSpan.Zero)
+            position = TimeSpan.Zero;
+
+        if (position > _file_reader.TotalTime)
+            position = _file_reader.TotalTime;
+
+        _file_reader.CurrentTime = position;
     }
 
     static bool IsSuportedFile(string file_type)
@@ -102,50 +144,12 @@ class MusicManager
         }
         return false;
     }
+
+    // public void AddEvent()
+    // {
+    //     _output_device.PlaybackStopped
+    // }
 }
-
-class SpectrumSampleProvider : ISampleProvider
-{
-    private readonly ISampleProvider _source;
-    private readonly float[] _circularBuffer;
-    private int _bufferIndex = 0;
-
-    public WaveFormat WaveFormat => _source.WaveFormat;
-
-    public SpectrumSampleProvider(ISampleProvider source, int bufferSize = 4096)
-    {
-        _source = source;
-        _circularBuffer = new float[bufferSize];
-    }
-
-    public int Read(float[] buffer, int offset, int count)
-    {
-        int samplesRead = _source.Read(buffer, offset, count);
-
-        for (int i = 0; i < samplesRead; i++)
-        {
-            _circularBuffer[_bufferIndex] = buffer[offset + i];
-            _bufferIndex = (_bufferIndex + 1) % _circularBuffer.Length;
-        }
-
-        return samplesRead;
-    }
-
-    public float[] GetLastSamples()
-    {
-        int size = _circularBuffer.Length;
-        float[] result = new float[size];
-
-        for (int i = 0; i < size; i++)
-        {
-            result[i] = _circularBuffer[(_bufferIndex + i) % size];
-        }
-
-        return result;
-    }
-}
-
-
 
 struct TrackInfo
 {
