@@ -8,7 +8,14 @@ class Program
 {
     static void Main()
     {
-        new MusicManager("./").Play();
+        try
+        {
+            new MusicManager("./").Play();
+        }
+        finally
+        {
+            Console.CursorVisible = true;
+        }
 
 
         Console.WriteLine("\nВоспроизведение остановлено.");
