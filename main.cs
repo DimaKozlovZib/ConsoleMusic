@@ -116,6 +116,7 @@ class SpectrumSampleProvider : ISampleProvider
     private readonly ISampleProvider _source;
     private readonly float[] _circularBuffer;
     private int _bufferIndex = 0;
+    private readonly object _lock = new object();
 
     public WaveFormat WaveFormat => _source.WaveFormat;
 
@@ -129,10 +130,13 @@ class SpectrumSampleProvider : ISampleProvider
     {
         int samplesRead = _source.Read(buffer, offset, count);
 
-        for (int i = 0; i < samplesRead; i++)
+        lock (_lock)
         {
-            _circularBuffer[_bufferIndex] = buffer[offset + i];
-            _bufferIndex = (_bufferIndex + 1) % _circularBuffer.Length;
+            for (int i = 0; i < samplesRead; i++)
+            {
+                _circularBuffer[_bufferIndex] = buffer[offset + i];
+                _bufferIndex = (_bufferIndex + 1) % _circularBuffer.Length;
+            }
         }
 
         return samplesRead;
@@ -143,9 +147,12 @@ class SpectrumSampleProvider : ISampleProvider
         int size = _circularBuffer.Length;
         float[] result = new float[size];
 
-        for (int i = 0; i < size; i++)
+        lock (_lock)
         {
-            result[i] = _circularBuffer[(_bufferIndex + i) % size];
+            for (int i = 0; i < size; i++)
+            {
+                result[i] = _circularBuffer[(_bufferIndex + i) % size];
+            }
         }
 
         return result;
